@@ -215,11 +215,19 @@ void applyBackend(AppState& s)
     }
     else
     {
-        // Installs/starts the driver service and registers mem::g_kernel; on
-        // failure attachToProcess below falls back to WinAPI on its own.
+        // Starts the driver service and opens the device; on failure
+        // attachToProcess below falls back to WinAPI on its own.
         std::string status;
         mem::driver::start(status);
         s.driverStatus = status;
+    }
+
+    // No pid to reattach with - if the driver just died, treat it as the target exiting.
+    if (s.proc.backend == mem::Backend::Physical)
+    {
+        if (!mem::driver::active())
+            onProcessExited(s);
+        return;
     }
 
     // Flipping proc.backend in place would leave a WinApi handle open-but-unused
@@ -489,6 +497,48 @@ void pollProcessAlive(AppState& s)
     if (!mem::is_alive(s.proc)) onProcessExited(s);
 }
 
+// Shared tail of attachToProcess/attachToPhysicalMemory, once s.proc/
+// processLabel/procIconPath already describe the new target.
+void resetForNewTarget(AppState& s)
+{
+    s.attachError[0]     = '\0';
+    s.procExited         = false;
+    s.procAliveNextCheck = 0.0;
+    s.resultSel.clear();
+    s.selAnchor = -1;
+    s.scan.reset();
+
+    s.modules.clear();
+    s.exportCache.clear();
+    s.sectionCache.clear();
+    s.symbols.clear();
+    s.symScanQueue.clear();
+    s.modulesNextRefresh = 0.0;
+
+    // Module list is now empty, so anchored entries have no valid base: flag them
+    // unresolved (address zeroed) until the first refresh re-resolves them against
+    // the new target. Absolute entries are left as-is.
+    rebaseAddyList(s);
+
+    // Drop any in-flight Find Signature so a stale hit can't jump after re-attach.
+    s.findSigScan.reset();
+    s.findSigPending = false;
+    s.showFindSig    = false;
+    s.findSigHits.clear();
+    s.findSigTotal   = 0;
+    s.findSigLen     = 0;
+    s.findSigSel     = -1;
+
+    // Clear the Memory View position so the next open re-seeds from the new
+    // target's main module (or, for physical memory, its first RAM range).
+    s.disasmAddr = 0;
+    s.hexAddr    = 0;
+    s.disasmHistory.clear();
+    s.hexHistory.clear();
+    if (s.showMemView) openMemoryView(s);
+    if (s.showStructDissect) openStructDissect(s);
+}
+
 bool attachToProcess(AppState& s, const mem::ProcessEntry& entry)
 {
     // Backend::Kernel skips OpenProcess entirely (see mem::open), so it must be
@@ -520,47 +570,30 @@ bool attachToProcess(AppState& s, const mem::ProcessEntry& entry)
 
     mem::close(s.proc);
     s.proc = next;
-
-    s.attachError[0]     = '\0';
-    s.procExited         = false;
-    s.procAliveNextCheck = 0.0;
     snprintf(s.processLabel, sizeof(s.processLabel),
         "%s  (PID: %lu)", entry.name.c_str(), entry.pid);
     s.procIconPath = entry.path;
-    s.resultSel.clear();
-    s.selAnchor = -1;
-    s.scan.reset();
 
-    // Everything read out of the previous target's address space.
-    s.modules.clear();
-    s.exportCache.clear();
-    s.sectionCache.clear();
-    s.symbols.clear();
-    s.symScanQueue.clear();
-    s.modulesNextRefresh = 0.0;
+    resetForNewTarget(s);
+    return true;
+}
 
-    // Module list is now empty, so anchored entries have no valid base: flag them
-    // unresolved (address zeroed) until the first refresh re-resolves them against
-    // the new process. Absolute entries are left as-is.
-    rebaseAddyList(s);
+bool attachToPhysicalMemory(AppState& s)
+{
+    mem::Process next;
+    if (!mem::open_physical(next))
+    {
+        snprintf(s.attachError, sizeof(s.attachError),
+            "Physical memory requires the kernel driver - enable it in Settings.");
+        return false;
+    }
 
-    // Drop any in-flight Find Signature so a stale hit can't jump after re-attach.
-    s.findSigScan.reset();
-    s.findSigPending = false;
-    s.showFindSig    = false;
-    s.findSigHits.clear();
-    s.findSigTotal   = 0;
-    s.findSigLen     = 0;
-    s.findSigSel     = -1;
+    mem::close(s.proc);
+    s.proc = next;
+    snprintf(s.processLabel, sizeof(s.processLabel), "Physical Memory");
+    s.procIconPath.clear();
 
-    // Clear the Memory View position so the next open re-seeds from the new
-    // process's main module.
-    s.disasmAddr = 0;
-    s.hexAddr    = 0;
-    s.disasmHistory.clear();
-    s.hexHistory.clear();
-    if (s.showMemView) openMemoryView(s);
-    if (s.showStructDissect) openStructDissect(s);
+    resetForNewTarget(s);
     return true;
 }
 
@@ -606,17 +639,28 @@ void openMemoryView(AppState& s)
     if (!s.proc.is_open()) return;
 
     s.memViewArch = mem::is_wow64(s.proc) ? 1 : 0;
+    s.memRegions  = mem::query_regions(s.proc);
 
-    // Keep the previous position on reopen; seed from the main module base only
-    // on the first open (or after attaching, which clears the address).
+    // Keep the previous position on reopen; seed a starting address only on the
+    // first open (or after attaching, which clears it).
     if (s.disasmAddr == 0)
     {
-        uintptr_t base = mem::main_module_base(s.proc);
-        if (base == 0)
+        uintptr_t base = 0;
+        if (s.proc.backend == mem::Backend::Physical)
         {
-            // No module list (e.g. protected process): use the first exec region.
-            for (const auto& r : mem::query_regions(s.proc))
-                if (mem::is_executable(r.protect)) { base = r.base; break; }
+            // No modules/exec regions in physical space - start at the first
+            // installed-RAM range instead.
+            if (!s.memRegions.empty()) base = s.memRegions.front().base;
+        }
+        else
+        {
+            base = mem::main_module_base(s.proc);
+            if (base == 0)
+            {
+                // No module list (e.g. protected process): use the first exec region.
+                for (const auto& r : s.memRegions)
+                    if (mem::is_executable(r.protect)) { base = r.base; break; }
+            }
         }
 
         s.disasmAddr = base;
@@ -624,8 +668,6 @@ void openMemoryView(AppState& s)
         snprintf(s.memGotoInput, sizeof(s.memGotoInput), "%llX",
             (unsigned long long)base);
     }
-
-    s.memRegions = mem::query_regions(s.proc);
 }
 
 void openMemoryViewAt(AppState& s, uintptr_t address)
@@ -1509,9 +1551,16 @@ static size_t coveredOpcodeLen(const AppState& s, uintptr_t address,
     return covered < newLen ? newLen : covered;
 }
 
+// Shared by Assemble, Change Opcode and NOP-fill. Modals show it inline (no
+// timer - they stay open); the toolbar times it out for actions with no modal.
+static void setWriteError(AppState& s, const char* msg)
+{
+    snprintf(s.writeError, sizeof(s.writeError), "%s", msg);
+    s.writeErrorUntil = ImGui::GetTime() + 4.0;
+}
+
 // Write `out` at s.asmAddress, padding the tail with NOPs up to padTo. Clears
-// the modals on success, sets s.asmError on failure. `out` is by value so it can
-// be resized for padding.
+// the modals on success. `out` is by value so it can be resized for padding.
 static bool writeAsmResult(AppState& s, std::vector<uint8_t> out, size_t padTo)
 {
     if (padTo > out.size())
@@ -1519,12 +1568,12 @@ static bool writeAsmResult(AppState& s, std::vector<uint8_t> out, size_t padTo)
     if (!s.proc.is_open() ||
         !mem::write_raw(s.proc, s.asmAddress, out.data(), out.size()))
     {
-        snprintf(s.asmError, sizeof(s.asmError), "Failed to write to process memory");
+        setWriteError(s, "Failed to write memory");
         return false;
     }
     s.showAssemble      = false;
     s.showAsmNopConfirm = false;
-    s.asmError[0]       = '\0';
+    s.writeError[0]     = '\0';
     return true;
 }
 
@@ -1535,7 +1584,7 @@ bool assembleAndWrite(AppState& s)
     const bool arch64 = (s.memViewArch == 0);
     if (!mem::assemble(s.asmInput, s.asmAddress, arch64, bytes, err))
     {
-        snprintf(s.asmError, sizeof(s.asmError), "%s", err.c_str());
+        setWriteError(s, err.c_str());
         return false;
     }
 
@@ -1600,7 +1649,7 @@ bool changeOpcodeAndWrite(AppState& s)
     std::string err;
     if (!parseHexBytes(s.opcodeInput, bytes, err))
     {
-        snprintf(s.opcodeError, sizeof(s.opcodeError), "%s", err.c_str());
+        setWriteError(s, err.c_str());
         return false;
     }
     // Pad short edits with NOPs so no half-decoded instruction is left dangling.
@@ -1610,23 +1659,29 @@ bool changeOpcodeAndWrite(AppState& s)
     if (!s.proc.is_open() ||
         !mem::write_raw(s.proc, s.opcodeAddress, bytes.data(), bytes.size()))
     {
-        snprintf(s.opcodeError, sizeof(s.opcodeError),
-            "Failed to write to process memory");
+        setWriteError(s, "Failed to write memory");
         return false;
     }
     s.showChangeOpcode = false;
-    s.opcodeError[0]   = '\0';
+    s.writeError[0]    = '\0';
     return true;
 }
 
-void nopFill(AppState& s, uintptr_t address, size_t length)
+bool nopFill(AppState& s, uintptr_t address, size_t length)
 {
-    if (!s.proc.is_open() || length == 0) return;
+    if (!s.proc.is_open() || length == 0) return false;
 
     // Plain single-byte 0x90 NOPs. Multi-byte NOP forms would decode as one
     // different-looking instruction rather than N separate NOPs.
     std::vector<uint8_t> buf(length, 0x90);
-    mem::write_raw(s.proc, address, buf.data(), buf.size());
+    if (mem::write_raw(s.proc, address, buf.data(), buf.size()))
+    {
+        s.writeError[0] = '\0';
+        return true;
+    }
+
+    setWriteError(s, "NOP write failed");
+    return false;
 }
 
 void generateSignature(AppState& s)

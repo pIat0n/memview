@@ -21,9 +21,21 @@
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define MEMVIEW_IOCTL_PROTECT \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define MEMVIEW_IOCTL_READ_PHYSICAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define MEMVIEW_IOCTL_WRITE_PHYSICAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define MEMVIEW_IOCTL_QUERY_PHYSICAL_RANGES \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define MEMVIEW_IOCTL_VIRTUAL_TO_PHYSICAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Generous fixed upper bound so the client can allocate one output buffer up front.
 #define MEMVIEW_MAX_MODULES 256
+
+// Physical memory has far fewer, larger ranges than modules - a few dozen at
+// most - but the cap keeps the same one-shot-buffer contract as MEMVIEW_MAX_MODULES.
+#define MEMVIEW_MAX_PHYSICAL_RANGES 128
 
 // READ:  in = MEMVIEW_REQUEST, out = `size` bytes read from the target.
 // WRITE: in = MEMVIEW_REQUEST followed by `size` payload bytes, no output.
@@ -77,4 +89,28 @@ typedef struct _MEMVIEW_PROTECT_REQUEST {
 typedef struct _MEMVIEW_PROTECT_RESPONSE {
     unsigned long oldProtect;
 } MEMVIEW_PROTECT_RESPONSE;
+
+// READ_PHYSICAL/WRITE_PHYSICAL: same shape as READ/WRITE, but `address` is
+// physical, not a process VA.
+typedef struct _MEMVIEW_PHYSICAL_REQUEST {
+    unsigned long long address;
+    unsigned long long size;
+} MEMVIEW_PHYSICAL_REQUEST;
+
+// QUERY_PHYSICAL_RANGES out: the installed-RAM map, up to MEMVIEW_MAX_PHYSICAL_RANGES.
+typedef struct _MEMVIEW_PHYSICAL_RANGE {
+    unsigned long long base;
+    unsigned long long size;
+} MEMVIEW_PHYSICAL_RANGE;
+
+// VIRTUAL_TO_PHYSICAL: `address` is a VA in `pid`'s own address space.
+typedef struct _MEMVIEW_VIRT_TO_PHYS_REQUEST {
+    unsigned long long pid;
+    unsigned long long address;
+} MEMVIEW_VIRT_TO_PHYS_REQUEST;
+
+// physicalAddress is 0 (not an error) if the page isn't resident.
+typedef struct _MEMVIEW_VIRT_TO_PHYS_RESPONSE {
+    unsigned long long physicalAddress;
+} MEMVIEW_VIRT_TO_PHYS_RESPONSE;
 #pragma pack(pop)

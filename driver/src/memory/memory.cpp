@@ -1,62 +1,13 @@
 #include "memory.hpp"
+#include "../nt/process.hpp"
 #include "../nt/structs.hpp"
 
 namespace memview {
 namespace {
 
-// PEB.Ldr sits at a fixed, well-known offset; nothing before it is needed.
 constexpr SIZE_T kPebLdrOffset64 = 0x18;
 constexpr SIZE_T kPebLdrOffset32 = 0x0C;
 
-// Reference to a process looked up by PID. Released automatically on scope exit,
-// so every return path - including early ones - drops the reference exactly once.
-class ProcessRef
-{
-public:
-    explicit ProcessRef(HANDLE pid)
-    {
-        m_status = PsLookupProcessByProcessId(pid, &m_process);
-    }
-
-    ~ProcessRef()
-    {
-        if (m_process)
-            ObDereferenceObject(m_process);
-    }
-
-    ProcessRef(const ProcessRef&)            = delete;
-    ProcessRef& operator=(const ProcessRef&) = delete;
-
-    NTSTATUS status() const { return m_status; }
-    PEPROCESS get() const   { return m_process; }
-
-private:
-    PEPROCESS m_process = nullptr;
-    NTSTATUS  m_status  = STATUS_UNSUCCESSFUL;
-};
-
-// Attaches to `process` so the Zw* calls below can target it via ZwCurrentProcess() - no handle opened.
-class ProcessAttach
-{
-public:
-    explicit ProcessAttach(PEPROCESS process)
-    {
-        KeStackAttachProcess(process, &m_apc);
-    }
-
-    ~ProcessAttach()
-    {
-        KeUnstackDetachProcess(&m_apc);
-    }
-
-    ProcessAttach(const ProcessAttach&)            = delete;
-    ProcessAttach& operator=(const ProcessAttach&) = delete;
-
-private:
-    KAPC_STATE m_apc;
-};
-
-// Reads cross-process into this (system) context; false on any short/failed copy.
 bool ReadRemote(PEPROCESS process, PVOID address, PVOID out, SIZE_T size)
 {
     SIZE_T copied = 0;
@@ -64,7 +15,6 @@ bool ReadRemote(PEPROCESS process, PVOID address, PVOID out, SIZE_T size)
         out, size, KernelMode, &copied)) && copied == size;
 }
 
-// Walks one PEB_LDR_DATA.InMemoryOrderModuleList (native x64 layout).
 ULONG ListModulesNative(PEPROCESS process, PPEB peb, MEMVIEW_MODULE_INFO* out, ULONG maxCount)
 {
     PVOID ldrPtr = nullptr;
@@ -103,7 +53,6 @@ ULONG ListModulesNative(PEPROCESS process, PPEB peb, MEMVIEW_MODULE_INFO* out, U
     return count;
 }
 
-// Same walk, 32-bit pointer layout, for a WOW64 target's own PEB.
 ULONG ListModulesWow64(PEPROCESS process, PVOID wow64Peb, MEMVIEW_MODULE_INFO* out, ULONG maxCount)
 {
     ULONG ldrPtr = 0;

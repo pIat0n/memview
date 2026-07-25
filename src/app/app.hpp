@@ -54,6 +54,10 @@ void startNextScan(AppState& s);
 // false on failure, with s.attachError set for the picker to show.
 bool attachToProcess(AppState& s, const mem::ProcessEntry& entry);
 
+// Attach to raw physical RAM instead of a process. Returns false (with
+// s.attachError set) if the driver isn't loaded.
+bool attachToPhysicalMemory(AppState& s);
+
 // Call once per frame: notices the target exiting and tears the session down.
 // Rate-limited, so it costs a wait syscall a few times a second.
 void pollProcessAlive(AppState& s);
@@ -161,7 +165,7 @@ bool addrInput(AppState& s, const char* id, char* buf, size_t bufSize,
     const char* hint = nullptr);
 
 // Assemble s.asmInput at s.asmAddress and write it into the target. Closes the
-// modal on success; leaves it open with s.asmError on failure.
+// modal on success; leaves it open with s.writeError on failure.
 bool assembleAndWrite(AppState& s);
 
 // Resolve the NOP-pad prompt: write the bytes stashed by assembleAndWrite. If
@@ -170,11 +174,12 @@ bool commitAsmBytes(AppState& s, bool padWithNops);
 
 // Parse the hex bytes in s.opcodeInput and write them at s.opcodeAddress
 // (whitespace-tolerant). Short edits pad the tail with NOPs up to s.opcodeOrigLen.
-// Closes the modal on success; leaves it open with s.opcodeError on failure.
+// Closes the modal on success; leaves it open with s.writeError on failure.
 bool changeOpcodeAndWrite(AppState& s);
 
-// Overwrite `length` bytes at `address` with single-byte 0x90 NOPs.
-void nopFill(AppState& s, uintptr_t address, size_t length);
+// Overwrite `length` bytes at `address` with single-byte 0x90 NOPs. False
+// (with s.writeError set) if the write failed.
+bool nopFill(AppState& s, uintptr_t address, size_t length);
 
 // (Re)generate the signature for s.sigAddress in style s.sigStyle, filling
 // s.sigOutput/s.sigUnique. Called when the modal opens or its style changes.

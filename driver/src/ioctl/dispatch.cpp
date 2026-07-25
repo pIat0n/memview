@@ -2,6 +2,7 @@
 
 #include "ioctl.hpp"
 #include "../memory/memory.hpp"
+#include "../physmem/physmem.hpp"
 
 namespace memview {
 
@@ -166,6 +167,82 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT, PIRP irp)
         {
             const MEMVIEW_PROTECT_RESPONSE resp{ oldProtect };
             *static_cast<MEMVIEW_PROTECT_RESPONSE*>(sysBuf) = resp;
+            copied = sizeof(resp);
+        }
+        break;
+    }
+
+    case MEMVIEW_IOCTL_READ_PHYSICAL:
+    case MEMVIEW_IOCTL_WRITE_PHYSICAL:
+    {
+        if (inLen < sizeof(MEMVIEW_PHYSICAL_REQUEST))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        const MEMVIEW_PHYSICAL_REQUEST req = *static_cast<MEMVIEW_PHYSICAL_REQUEST*>(sysBuf);
+        if (req.size == 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (code == MEMVIEW_IOCTL_READ_PHYSICAL)
+        {
+            // Output buffer must hold the whole requested read.
+            if (outLen < req.size)
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+            status = ReadPhysicalMemory(reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(req.address)),
+                                  sysBuf, static_cast<SIZE_T>(req.size), &copied);
+        }
+        else
+        {
+            // Input holds the header followed by `size` payload bytes.
+            if (inLen < sizeof(MEMVIEW_PHYSICAL_REQUEST) + req.size)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            status = WritePhysicalMemory(reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(req.address)),
+                                   static_cast<PUCHAR>(sysBuf) + sizeof(MEMVIEW_PHYSICAL_REQUEST),
+                                   static_cast<SIZE_T>(req.size), &copied);
+        }
+
+        // A short copy is a failure to the caller, but report what did move.
+        if (NT_SUCCESS(status) && copied != req.size)
+            status = STATUS_PARTIAL_COPY;
+        break;
+    }
+
+    case MEMVIEW_IOCTL_QUERY_PHYSICAL_RANGES:
+    {
+        const ULONG maxOut = outLen / sizeof(MEMVIEW_PHYSICAL_RANGE);
+        const ULONG cap    = maxOut < MEMVIEW_MAX_PHYSICAL_RANGES ? maxOut : MEMVIEW_MAX_PHYSICAL_RANGES;
+        const ULONG count  = GetPhysicalRanges(static_cast<MEMVIEW_PHYSICAL_RANGE*>(sysBuf), cap);
+        copied = static_cast<SIZE_T>(count) * sizeof(MEMVIEW_PHYSICAL_RANGE);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    case MEMVIEW_IOCTL_VIRTUAL_TO_PHYSICAL:
+    {
+        if (inLen < sizeof(MEMVIEW_VIRT_TO_PHYS_REQUEST) || outLen < sizeof(MEMVIEW_VIRT_TO_PHYS_RESPONSE))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        const MEMVIEW_VIRT_TO_PHYS_REQUEST req = *static_cast<MEMVIEW_VIRT_TO_PHYS_REQUEST*>(sysBuf);
+
+        ULONGLONG pa = 0;
+        status = VirtualToPhysical(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(req.pid)),
+                                    reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(req.address)), &pa);
+        if (NT_SUCCESS(status))
+        {
+            const MEMVIEW_VIRT_TO_PHYS_RESPONSE resp{ pa };
+            *static_cast<MEMVIEW_VIRT_TO_PHYS_RESPONSE*>(sysBuf) = resp;
             copied = sizeof(resp);
         }
         break;

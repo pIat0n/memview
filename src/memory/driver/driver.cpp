@@ -10,10 +10,8 @@
 namespace mem::driver {
 namespace {
 
-// The open handle to \\.\MemView, or INVALID_HANDLE_VALUE when the driver isn't up.
 HANDLE g_device = INVALID_HANDLE_VALUE;
 
-// memview.sys ships next to memview.exe, so derive the SCM binary path from our own.
 std::wstring driverSysPath()
 {
     wchar_t exe[MAX_PATH];
@@ -28,134 +26,6 @@ std::wstring driverSysPath()
     return p.substr(0, slash + 1) + L"memview.sys";
 }
 
-// Returns bytes transferred (0 on any failure, so a denied read looks like a short one).
-size_t drvRead(DWORD pid, uintptr_t addr, void* buf, size_t n)
-{
-    if (g_device == INVALID_HANDLE_VALUE || n == 0)
-        return 0;
-
-    MEMVIEW_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n };
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_READ, &req, sizeof(req),
-                         buf, (DWORD)n, &returned, nullptr))
-        return 0;
-    return returned;
-}
-
-// Header + payload go in one input buffer; the driver only reports success on a full copy.
-size_t drvWrite(DWORD pid, uintptr_t addr, const void* buf, size_t n)
-{
-    if (g_device == INVALID_HANDLE_VALUE || n == 0)
-        return 0;
-
-    std::vector<uint8_t> in(sizeof(MEMVIEW_REQUEST) + n);
-    MEMVIEW_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n };
-    memcpy(in.data(), &req, sizeof(req));
-    memcpy(in.data() + sizeof(req), buf, n);
-
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_WRITE, in.data(), (DWORD)in.size(),
-                         nullptr, 0, &returned, nullptr))
-        return 0;
-    return n;
-}
-
-bool drvIsWow64(DWORD pid)
-{
-    if (g_device == INVALID_HANDLE_VALUE)
-        return false;
-
-    MEMVIEW_PID_REQUEST req{ pid };
-    MEMVIEW_PROCESS_INFO info{};
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_PROCESS, &req, sizeof(req),
-                         &info, sizeof(info), &returned, nullptr))
-        return false;
-    return info.isWow64 != 0;
-}
-
-// Short name is just the full path's last component (Toolhelp's szModule equivalent).
-std::vector<mem::ModuleEntry> drvListModules(DWORD pid)
-{
-    std::vector<mem::ModuleEntry> out;
-    if (g_device == INVALID_HANDLE_VALUE)
-        return out;
-
-    MEMVIEW_PID_REQUEST req{ pid };
-    std::vector<MEMVIEW_MODULE_INFO> buf(MEMVIEW_MAX_MODULES);
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_LIST_MODULES, &req, sizeof(req),
-                         buf.data(), (DWORD)(buf.size() * sizeof(MEMVIEW_MODULE_INFO)),
-                         &returned, nullptr))
-        return out;
-
-    const size_t count = returned / sizeof(MEMVIEW_MODULE_INFO);
-    out.reserve(count);
-    for (size_t i = 0; i < count; ++i)
-    {
-        char pathBuf[1024];
-        WideCharToMultiByte(CP_UTF8, 0, buf[i].path, -1, pathBuf, sizeof(pathBuf), nullptr, nullptr);
-
-        std::string path = pathBuf;
-        std::string name = path;
-        if (const size_t slash = path.find_last_of("\\/"); slash != std::string::npos)
-            name = path.substr(slash + 1);
-
-        out.push_back({ (uintptr_t)buf[i].base, (size_t)buf[i].size, name, path });
-    }
-    return out;
-}
-
-bool drvQueryRegion(DWORD pid, uintptr_t addr, mem::Region& out)
-{
-    if (g_device == INVALID_HANDLE_VALUE)
-        return false;
-
-    MEMVIEW_QUERY_REGION_REQUEST req{ pid, (unsigned long long)addr };
-    MEMVIEW_REGION_INFO info{};
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_REGION, &req, sizeof(req),
-                         &info, sizeof(info), &returned, nullptr))
-        return false;
-
-    out.base    = (uintptr_t)info.base;
-    out.size    = (size_t)info.size;
-    out.protect = info.protect;
-    out.type    = info.type;
-    out.state   = info.state;
-    return true;
-}
-
-bool drvProtect(DWORD pid, uintptr_t addr, size_t n, DWORD newProtect, DWORD& oldProtect)
-{
-    oldProtect = 0;
-    if (g_device == INVALID_HANDLE_VALUE)
-        return false;
-
-    MEMVIEW_PROTECT_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n, newProtect };
-    MEMVIEW_PROTECT_RESPONSE resp{};
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_PROTECT, &req, sizeof(req),
-                         &resp, sizeof(resp), &returned, nullptr))
-        return false;
-
-    oldProtect = resp.oldProtect;
-    return true;
-}
-
-// Register/clear the hooks mem::read_bytes/write_bytes/etc. dispatch through.
-void registerBackend()
-{
-    mem::g_kernel.read        = &drvRead;
-    mem::g_kernel.write       = &drvWrite;
-    mem::g_kernel.isWow64     = &drvIsWow64;
-    mem::g_kernel.listModules = &drvListModules;
-    mem::g_kernel.queryRegion = &drvQueryRegion;
-    mem::g_kernel.protect     = &drvProtect;
-}
-void unregisterBackend() { mem::g_kernel = mem::KernelBackend{}; }
-
-// Returns true once the service is running; `status` gets a reason on failure.
 bool ensureServiceRunning(const std::wstring& sysPath, std::string& status)
 {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
@@ -209,7 +79,6 @@ bool ensureServiceRunning(const std::wstring& sysPath, std::string& status)
     return ok;
 }
 
-// Best-effort: failures are ignored (usually just means it was never installed).
 void removeServiceIfPresent()
 {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
@@ -255,15 +124,12 @@ bool start(std::string& status)
         return false;
     }
 
-    registerBackend();
     status = "Kernel driver active.";
     return true;
 }
 
 void stop(bool removeService)
 {
-    unregisterBackend();
-
     if (g_device != INVALID_HANDLE_VALUE)
     {
         CloseHandle(g_device);
@@ -278,5 +144,183 @@ bool active()
 {
     return g_device != INVALID_HANDLE_VALUE;
 }
+
+size_t read(uint32_t pid, uintptr_t addr, void* buf, size_t n)
+{
+    if (g_device == INVALID_HANDLE_VALUE || n == 0)
+        return 0;
+
+    MEMVIEW_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n };
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_READ, &req, sizeof(req),
+                         buf, (DWORD)n, &returned, nullptr))
+        return 0;
+    return returned;
+}
+
+size_t write(uint32_t pid, uintptr_t addr, const void* buf, size_t n)
+{
+    if (g_device == INVALID_HANDLE_VALUE || n == 0)
+        return 0;
+
+    std::vector<uint8_t> in(sizeof(MEMVIEW_REQUEST) + n);
+    MEMVIEW_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n };
+    memcpy(in.data(), &req, sizeof(req));
+    memcpy(in.data() + sizeof(req), buf, n);
+
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_WRITE, in.data(), (DWORD)in.size(),
+                         nullptr, 0, &returned, nullptr))
+        return 0;
+    return n;
+}
+
+bool isWow64(uint32_t pid)
+{
+    if (g_device == INVALID_HANDLE_VALUE)
+        return false;
+
+    MEMVIEW_PID_REQUEST req{ pid };
+    MEMVIEW_PROCESS_INFO info{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_PROCESS, &req, sizeof(req),
+                         &info, sizeof(info), &returned, nullptr))
+        return false;
+    return info.isWow64 != 0;
+}
+
+std::vector<mem::ModuleEntry> listModules(uint32_t pid)
+{
+    std::vector<mem::ModuleEntry> out;
+    if (g_device == INVALID_HANDLE_VALUE)
+        return out;
+
+    MEMVIEW_PID_REQUEST req{ pid };
+    std::vector<MEMVIEW_MODULE_INFO> buf(MEMVIEW_MAX_MODULES);
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_LIST_MODULES, &req, sizeof(req),
+                         buf.data(), (DWORD)(buf.size() * sizeof(MEMVIEW_MODULE_INFO)),
+                         &returned, nullptr))
+        return out;
+
+    const size_t count = returned / sizeof(MEMVIEW_MODULE_INFO);
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        char pathBuf[1024];
+        WideCharToMultiByte(CP_UTF8, 0, buf[i].path, -1, pathBuf, sizeof(pathBuf), nullptr, nullptr);
+
+        std::string path = pathBuf;
+        std::string name = path;
+        if (const size_t slash = path.find_last_of("\\/"); slash != std::string::npos)
+            name = path.substr(slash + 1);
+
+        out.push_back({ (uintptr_t)buf[i].base, (size_t)buf[i].size, name, path });
+    }
+    return out;
+}
+
+bool queryRegion(uint32_t pid, uintptr_t addr, mem::Region& out)
+{
+    if (g_device == INVALID_HANDLE_VALUE)
+        return false;
+
+    MEMVIEW_QUERY_REGION_REQUEST req{ pid, (unsigned long long)addr };
+    MEMVIEW_REGION_INFO info{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_REGION, &req, sizeof(req),
+                         &info, sizeof(info), &returned, nullptr))
+        return false;
+
+    out.base    = (uintptr_t)info.base;
+    out.size    = (size_t)info.size;
+    out.protect = info.protect;
+    out.type    = info.type;
+    out.state   = info.state;
+    return true;
+}
+
+bool protect(uint32_t pid, uintptr_t addr, size_t n, unsigned long newProtect, unsigned long& oldProtect)
+{
+    oldProtect = 0;
+    if (g_device == INVALID_HANDLE_VALUE)
+        return false;
+
+    MEMVIEW_PROTECT_REQUEST req{ pid, (unsigned long long)addr, (unsigned long long)n, newProtect };
+    MEMVIEW_PROTECT_RESPONSE resp{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_PROTECT, &req, sizeof(req),
+                         &resp, sizeof(resp), &returned, nullptr))
+        return false;
+
+    oldProtect = resp.oldProtect;
+    return true;
+}
+
+namespace phys {
+
+size_t read(uint64_t addr, void* buf, size_t n)
+{
+    if (g_device == INVALID_HANDLE_VALUE || n == 0)
+        return 0;
+
+    MEMVIEW_PHYSICAL_REQUEST req{ addr, (unsigned long long)n };
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_READ_PHYSICAL, &req, sizeof(req),
+                         buf, (DWORD)n, &returned, nullptr))
+        return 0;
+    return returned;
+}
+
+bool write(uint64_t addr, const void* buf, size_t n)
+{
+    if (g_device == INVALID_HANDLE_VALUE || n == 0)
+        return false;
+
+    std::vector<uint8_t> in(sizeof(MEMVIEW_PHYSICAL_REQUEST) + n);
+    MEMVIEW_PHYSICAL_REQUEST req{ addr, (unsigned long long)n };
+    memcpy(in.data(), &req, sizeof(req));
+    memcpy(in.data() + sizeof(req), buf, n);
+
+    DWORD returned = 0;
+    return DeviceIoControl(g_device, MEMVIEW_IOCTL_WRITE_PHYSICAL, in.data(), (DWORD)in.size(),
+                           nullptr, 0, &returned, nullptr) != 0;
+}
+
+std::vector<Range> ranges()
+{
+    std::vector<Range> out;
+    if (g_device == INVALID_HANDLE_VALUE)
+        return out;
+
+    std::vector<MEMVIEW_PHYSICAL_RANGE> buf(MEMVIEW_MAX_PHYSICAL_RANGES);
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_PHYSICAL_RANGES, nullptr, 0,
+                         buf.data(), (DWORD)(buf.size() * sizeof(MEMVIEW_PHYSICAL_RANGE)),
+                         &returned, nullptr))
+        return out;
+
+    const size_t count = returned / sizeof(MEMVIEW_PHYSICAL_RANGE);
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        out.push_back({ buf[i].base, buf[i].size });
+    return out;
+}
+
+uint64_t translate(uint32_t pid, uint64_t va)
+{
+    if (g_device == INVALID_HANDLE_VALUE)
+        return 0;
+
+    MEMVIEW_VIRT_TO_PHYS_REQUEST req{ pid, va };
+    MEMVIEW_VIRT_TO_PHYS_RESPONSE resp{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_VIRTUAL_TO_PHYSICAL, &req, sizeof(req),
+                         &resp, sizeof(resp), &returned, nullptr))
+        return 0;
+    return resp.physicalAddress;
+}
+
+} // namespace phys
 
 } // namespace mem::driver

@@ -26,6 +26,8 @@ A lightweight process memory scanner/editor for Windows.
 - **Assembler/Disassembler** - edit instructions on the fly (asmjit + Zydis), NOP-fill
 - **Signatures** - AOB signature generation
 - **Symbols** - PDB symbols per module, from disk or symbol server
+- **Kernel-Mode Driver** - optional for processes that block ReadProcessMemory
+- **Physical Memory** - browse and patch raw RAM directly, backed by the kernel driver
 
 ## requirements
 

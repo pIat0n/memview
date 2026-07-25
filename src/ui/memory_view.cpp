@@ -423,6 +423,12 @@ void drawMemoryView(app::AppState& s)
     ImGui::SameLine(0, 20);
     ImGui::Text("Mode: %s", s.memViewArch == 1 ? "x86" : "x64");
 
+    if (s.writeError[0] && ImGui::GetTime() < s.writeErrorUntil)
+    {
+        ImGui::SameLine(0, 20);
+        ImGui::TextColored(ImVec4(0.85f, 0.1f, 0.1f, 1.f), "%s", s.writeError);
+    }
+
     ImGui::Separator();
 
     // --- IDA-style pane sync -------------------------------------------------

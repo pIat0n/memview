@@ -175,9 +175,16 @@ void drawRegions(app::AppState& s)
             ImGui::Text("%llX", (unsigned long long)rg.size);
 
             ImGui::TableSetColumnIndex(2);
-            char prot[4];
-            protString(rg.protect, prot);
-            ImGui::TextUnformatted(prot);
+            if (s.proc.backend == mem::Backend::Physical)
+                // rg.protect is a stand-in value (see query_regions) - no real
+                // per-page protection to show for physical RAM.
+                ImGui::TextDisabled("N/A");
+            else
+            {
+                char prot[4];
+                protString(rg.protect, prot);
+                ImGui::TextUnformatted(prot);
+            }
 
             ImGui::TableSetColumnIndex(3);
             ImGui::TextUnformatted(typeString(rg.type));

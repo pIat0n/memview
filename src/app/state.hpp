@@ -176,7 +176,10 @@ struct AppState {
     bool      showAssemble    = false;
     uintptr_t asmAddress      = 0;
     char      asmInput[256]   = "";
-    char      asmError[128]   = "";
+
+    // Shared by Assemble, Change Opcode and NOP-fill - see setWriteError (app.cpp).
+    char   writeError[128] = "";
+    double writeErrorUntil = 0.0;
 
     // NOP-pad confirmation: shown when the assembled code is shorter than the
     // instruction(s) it overwrites (Yes = pad tail, No = write as-is, Cancel).
@@ -193,7 +196,6 @@ struct AppState {
     uintptr_t opcodeAddress     = 0;
     size_t    opcodeOrigLen     = 0;
     char      opcodeInput[256]  = "";
-    char      opcodeError[128]  = "";
 
     // Create-Signature modal. sigStyle 0 = IDA, 1 = Code.
     bool      showSignature   = false;

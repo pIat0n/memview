@@ -28,7 +28,7 @@ find_package(WDK REQUIRED)
 string(REGEX REPLACE "/RTC[1su]+" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
 string(REGEX REPLACE "/RTC[1su]+" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
 
-wdk_add_driver(memview src/main.cpp src/memory/memory.cpp src/ioctl/dispatch.cpp)
+wdk_add_driver(memview src/main.cpp src/memory/memory.cpp src/physmem/physmem.cpp src/ioctl/dispatch.cpp)
 
 # Test-sign right after linking, so any build trigger (VS Code's Build button,
 # `cmake --build`, build.cmd) produces a loadable .sys, not just the standalone

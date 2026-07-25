@@ -1,20 +1,43 @@
 #pragma once
+#include <cstdint>
 #include <string>
+#include <vector>
 
-// User-mode client for the MemView kernel driver (driver/src/main.cpp): installs and
-// starts it via the SCM, opens \\.\MemView, and registers mem::g_kernel. Needs the
-// app to run elevated and the driver to be loadable (signed, or test signing on).
+namespace mem { struct ModuleEntry; struct Region; }
+
 namespace mem::driver {
 
-// Installs/starts the service, opens the device, registers the kernel backend.
-// False leaves the backend unregistered with a reason in `status`. Idempotent.
 bool start(std::string& status);
 
-// Unregisters the backend and closes the device. removeService also stops/deletes
-// the service; otherwise it's left registered so a later start() is cheap.
 void stop(bool removeService = false);
 
-// True while the device is open and the backend is registered.
 bool active();
+
+size_t read(uint32_t pid, uintptr_t addr, void* buf, size_t n);
+size_t write(uint32_t pid, uintptr_t addr, const void* buf, size_t n);
+bool isWow64(uint32_t pid);
+std::vector<mem::ModuleEntry> listModules(uint32_t pid);
+bool queryRegion(uint32_t pid, uintptr_t addr, mem::Region& out);
+bool protect(uint32_t pid, uintptr_t addr, size_t n, unsigned long newProtect, unsigned long& oldProtect);
+
+namespace phys {
+
+struct Range {
+    uint64_t base;
+    uint64_t size;
+};
+
+size_t read(uint64_t addr, void* buf, size_t n);
+
+// False if the range isn't entirely inside installed RAM.
+bool write(uint64_t addr, const void* buf, size_t n);
+
+// The installed-RAM map, skipping MMIO/reserved holes.
+std::vector<Range> ranges();
+
+// 0 if the page isn't resident (not committed, or paged out).
+uint64_t translate(uint32_t pid, uint64_t va);
+
+} // namespace phys
 
 } // namespace mem::driver

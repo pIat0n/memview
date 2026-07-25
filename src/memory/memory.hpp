@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cctype>
 
+#include "memory/driver/driver.hpp"
+
 namespace mem {
 
 // ============================================================================
@@ -22,7 +24,8 @@ namespace mem {
 
 // WinApi uses a real process handle; Kernel routes everything through the
 // driver's IOCTL client instead and never opens a handle to the target.
-enum class Backend { WinApi, Kernel };
+// Physical isn't a process at all - see open_physical below.
+enum class Backend { WinApi, Kernel, Physical };
 
 struct ProcessEntry {
     DWORD       pid;
@@ -32,12 +35,13 @@ struct ProcessEntry {
 
 struct Process {
     DWORD   pid    = 0;
-    HANDLE  handle = nullptr;      // null in Backend::Kernel - no handle is held
+    HANDLE  handle = nullptr;      // null in Backend::Kernel/Physical - no handle is held
     char    name[MAX_PATH] = {};
     Backend backend = Backend::WinApi;
 
     bool is_open() const
     {
+        if (backend == Backend::Physical) return true;
         return backend == Backend::Kernel ? pid != 0 : (handle && handle != INVALID_HANDLE_VALUE);
     }
 };
@@ -57,27 +61,6 @@ struct Region {
     DWORD     type;    // MEM_IMAGE / MEM_MAPPED / MEM_PRIVATE
     DWORD     state;   // MEM_COMMIT / MEM_FREE / MEM_RESERVE
 };
-
-// ============================================================================
-// Read/write backend
-// ============================================================================
-
-// Hooks the driver client (src/memory/driver) fills in when the kernel driver
-// loads, so memory.hpp itself stays free of any driver dependency. Only ever
-// called for a Process with backend == Backend::Kernel.
-struct KernelBackend {
-    size_t (*read)(DWORD pid, uintptr_t addr, void* buf, size_t n)       = nullptr;
-    size_t (*write)(DWORD pid, uintptr_t addr, const void* buf, size_t n) = nullptr;
-    bool   (*isWow64)(DWORD pid) = nullptr;
-    std::vector<ModuleEntry> (*listModules)(DWORD pid) = nullptr;
-    bool   (*queryRegion)(DWORD pid, uintptr_t addr, Region& out) = nullptr;
-    bool   (*protect)(DWORD pid, uintptr_t addr, size_t n, DWORD newProtect, DWORD& oldProtect) = nullptr;
-
-    bool ready() const { return read && write; }
-};
-
-// Process-wide; the driver client sets/clears it on load/unload.
-inline KernelBackend g_kernel{};
 
 namespace detail {
 
@@ -214,6 +197,20 @@ inline bool open_by_name(Process& proc, const char* exe_name, Backend backend = 
     return false;
 }
 
+// No real process backs this - reads/writes go straight through driver::phys
+// by physical address. False if the driver isn't loaded (no WinApi fallback).
+inline bool open_physical(Process& proc)
+{
+    if (!driver::active())
+        return false;
+
+    proc.handle  = nullptr;
+    proc.pid     = 0;
+    proc.backend = Backend::Physical;
+    snprintf(proc.name, sizeof(proc.name), "Physical Memory");
+    return true;
+}
+
 // Enable SeDebugPrivilege so an elevated process can OpenProcess targets owned
 // by other users/sessions (e.g. SYSTEM services). Returns false if not elevated
 // or the privilege can't be granted.
@@ -243,6 +240,8 @@ inline bool enable_debug_privilege()
 // stays valid until close()).
 inline bool is_alive(const Process& proc)
 {
+    if (proc.backend == Backend::Physical)
+        return proc.is_open() && driver::active();
     return proc.is_open() && detail::process_exists(proc.pid);
 }
 
@@ -261,7 +260,9 @@ inline void close(Process& proc)
 inline std::vector<ModuleEntry> list_modules(const Process& proc)
 {
     if (proc.backend == Backend::Kernel)
-        return g_kernel.listModules ? g_kernel.listModules(proc.pid) : std::vector<ModuleEntry>{};
+        return driver::listModules(proc.pid);
+    if (proc.backend == Backend::Physical)
+        return {}; // no modules in raw physical address space
 
     std::vector<ModuleEntry> out;
     HANDLE snap = CreateToolhelp32Snapshot(
@@ -298,7 +299,9 @@ inline uintptr_t main_module_base(const Process& proc)
 inline bool is_wow64(const Process& proc)
 {
     if (proc.backend == Backend::Kernel)
-        return g_kernel.isWow64 && g_kernel.isWow64(proc.pid);
+        return driver::isWow64(proc.pid);
+    if (proc.backend == Backend::Physical)
+        return false; // no bitness to inherit - disassemble as x64
     BOOL wow = FALSE;
     return IsWow64Process(proc.handle, &wow) && wow;
 }
@@ -307,8 +310,10 @@ inline bool is_wow64(const Process& proc)
 // ReadProcessMemory. Every read path below funnels through here.
 inline size_t read_bytes(const Process& proc, uintptr_t addr, void* buf, size_t n)
 {
-    if (proc.backend == Backend::Kernel && g_kernel.read)
-        return g_kernel.read(proc.pid, addr, buf, n);
+    if (proc.backend == Backend::Physical)
+        return driver::phys::read(addr, buf, n);
+    if (proc.backend == Backend::Kernel)
+        return driver::read(proc.pid, addr, buf, n);
 
     SIZE_T rd = 0;
     ReadProcessMemory(proc.handle, reinterpret_cast<LPCVOID>(addr), buf, n, &rd);
@@ -318,8 +323,10 @@ inline size_t read_bytes(const Process& proc, uintptr_t addr, void* buf, size_t 
 // Write counterpart of read_bytes; protection handling stays in write_raw.
 inline size_t write_bytes(const Process& proc, uintptr_t addr, const void* buf, size_t n)
 {
-    if (proc.backend == Backend::Kernel && g_kernel.write)
-        return g_kernel.write(proc.pid, addr, buf, n);
+    if (proc.backend == Backend::Physical)
+        return driver::phys::write(addr, buf, n) ? n : 0;
+    if (proc.backend == Backend::Kernel)
+        return driver::write(proc.pid, addr, buf, n);
 
     SIZE_T wr = 0;
     WriteProcessMemory(proc.handle, reinterpret_cast<LPVOID>(addr), buf, n, &wr);
@@ -359,18 +366,21 @@ inline bool write_raw(const Process& proc, uintptr_t addr, const void* buf, size
     if (write_bytes(proc, addr, buf, n) == n)
         return true;
 
+    // No page protection to lift and retry - the driver already validated the range.
+    if (proc.backend == Backend::Physical)
+        return false;
+
     // Lift page protection and retry.
     if (proc.backend == Backend::Kernel)
     {
-        if (!g_kernel.protect) return false;
         DWORD oldProtect = 0;
-        if (!g_kernel.protect(proc.pid, addr, n, PAGE_EXECUTE_READWRITE, oldProtect))
+        if (!driver::protect(proc.pid, addr, n, PAGE_EXECUTE_READWRITE, oldProtect))
             return false;
 
         const bool ok = write_bytes(proc, addr, buf, n) == n;
 
         DWORD tmp = 0;
-        g_kernel.protect(proc.pid, addr, n, oldProtect, tmp);
+        driver::protect(proc.pid, addr, n, oldProtect, tmp);
         return ok;
     }
 
@@ -417,12 +427,20 @@ inline std::vector<Region> query_regions(const Process& proc, bool committed_onl
     std::vector<Region> out;
     uintptr_t addr = 0;
 
+    if (proc.backend == Backend::Physical)
+    {
+        // No real page protection here; PAGE_READWRITE/MEM_PRIVATE/MEM_COMMIT
+        // are a stand-in so scrollbars/Regions/scanning work unchanged.
+        for (const driver::phys::Range& r : driver::phys::ranges())
+            out.push_back({ (uintptr_t)r.base, (size_t)r.size,
+                             PAGE_READWRITE, MEM_PRIVATE, MEM_COMMIT });
+        return out;
+    }
+
     if (proc.backend == Backend::Kernel)
     {
-        if (!g_kernel.queryRegion) return out;
-
         Region r{};
-        while (g_kernel.queryRegion(proc.pid, addr, r))
+        while (driver::queryRegion(proc.pid, addr, r))
         {
             if (!committed_only || r.state == MEM_COMMIT)
                 out.push_back(r);
@@ -750,27 +768,37 @@ inline std::vector<ScanResult> scan_first(
         }
     };
 
+    // Read/scan in bounded windows, not the whole region at once - a physical
+    // RAM range can be many gigabytes in one block.
+    constexpr size_t kMaxWindow = 64 * 1024 * 1024;
+    constexpr size_t kPage      = 0x1000;
     for (auto& region : query_regions(proc))
     {
         if (cancelled()) return results;
         if (!is_scannable(region, wfilter, xfilter)) continue;
 
-        chunk.resize(region.size);
-        if (read_bytes(proc, region.base, chunk.data(), region.size) == region.size)
-        {
-            scanBuffer(region.base, chunk.data(), region.size);
-            continue;
-        }
-
-        // Whole-region read failed (a guard/decommitted page inside): fall back
-        // to page-by-page so the rest survives.
-        constexpr size_t kPage = 0x1000;
-        for (size_t p = 0; p < region.size; p += kPage)
+        for (size_t off = 0; off < region.size; off += kMaxWindow)
         {
             if (cancelled()) return results;
-            const size_t pageLen = std::min<size_t>(kPage, region.size - p);
-            const size_t pgot = read_bytes(proc, region.base + p, chunk.data(), pageLen);
-            if (pgot) scanBuffer(region.base + p, chunk.data(), pgot);
+            const size_t    want = std::min<size_t>(kMaxWindow, region.size - off);
+            const uintptr_t base = region.base + off;
+
+            chunk.resize(want);
+            if (read_bytes(proc, base, chunk.data(), want) == want)
+            {
+                scanBuffer(base, chunk.data(), want);
+                continue;
+            }
+
+            // This window's read failed (a guard/decommitted page inside): fall
+            // back to page-by-page so the rest survives.
+            for (size_t p = 0; p < want; p += kPage)
+            {
+                if (cancelled()) return results;
+                const size_t pageLen = std::min<size_t>(kPage, want - p);
+                const size_t pgot = read_bytes(proc, base + p, chunk.data(), pageLen);
+                if (pgot) scanBuffer(base + p, chunk.data(), pgot);
+            }
         }
     }
     return results;

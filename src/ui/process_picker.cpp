@@ -1,5 +1,6 @@
 #include "ui/process_picker.hpp"
 #include "app/app.hpp"
+#include "memory/driver/driver.hpp"
 #include <imgui.h>
 #include <windows.h>
 #include <shellapi.h> // ExtractIconExW for the icon cache below
@@ -12,6 +13,9 @@ namespace ui {
 
 namespace {
     constexpr float kIconSize = 16.0f;
+
+    // s.procSelected indexes s.procList (>= 0); this marks the pinned row instead.
+    constexpr int kPhysicalMemorySelected = -2;
 }
 
 void drawProcessPicker(app::AppState& s)
@@ -35,11 +39,12 @@ void drawProcessPicker(app::AppState& s)
     const double now = ImGui::GetTime();
     if (now >= s.procNextRefresh)
     {
+        const bool wasPhysSelected = (s.procSelected == kPhysicalMemorySelected);
         DWORD selPid = (s.procSelected >= 0 && s.procSelected < (int)s.procList.size())
                      ? s.procList[s.procSelected].pid : 0;
 
         s.procList     = mem::list_processes();
-        s.procSelected = -1;
+        s.procSelected = wasPhysSelected ? kPhysicalMemorySelected : -1;
         if (selPid)
             for (int i = 0; i < (int)s.procList.size(); ++i)
                 if (s.procList[i].pid == selPid) { s.procSelected = i; break; }
@@ -68,6 +73,36 @@ void drawProcessPicker(app::AppState& s)
         ImGui::TableSetupColumn("PID",     ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
+
+        // Pinned row: attach to raw physical RAM instead of a process.
+        {
+            const bool driverUp = mem::driver::active();
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(1);
+
+            ImGui::BeginDisabled(!driverUp);
+            const bool physSel = (s.procSelected == kPhysicalMemorySelected);
+            if (ImGui::Selectable("-", physSel,
+                ImGuiSelectableFlags_SpanAllColumns |
+                ImGuiSelectableFlags_AllowOverlap))
+                s.procSelected = kPhysicalMemorySelected;
+
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
+            {
+                if (app::attachToPhysicalMemory(s))
+                {
+                    s.showProcPicker = false;
+                    ImGui::EndDisabled();
+                    ImGui::EndTable(); ImGui::End(); return;
+                }
+            }
+            ImGui::EndDisabled();
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted("Physical Memory");
+            if (!driverUp && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Requires the kernel driver - enable it in Settings.");
+        }
 
         for (int i = 0; i < (int)s.procList.size(); ++i)
         {
@@ -120,12 +155,15 @@ void drawProcessPicker(app::AppState& s)
     }
 
     ImGui::Separator();
-    ImGui::BeginDisabled(s.procSelected < 0 ||
-        s.procSelected >= (int)s.procList.size());
+    const bool physSelected = (s.procSelected == kPhysicalMemorySelected);
+    ImGui::BeginDisabled(
+        (physSelected && !mem::driver::active()) ||
+        (!physSelected && (s.procSelected < 0 || s.procSelected >= (int)s.procList.size())));
     if (ImGui::Button("Open", ImVec2(80, 0)))
     {
-        if (app::attachToProcess(s, s.procList[s.procSelected]))
-            s.showProcPicker = false;
+        const bool ok = physSelected ? app::attachToPhysicalMemory(s)
+                                      : app::attachToProcess(s, s.procList[s.procSelected]);
+        if (ok) s.showProcPicker = false;
     }
     ImGui::EndDisabled();
     ImGui::SameLine();

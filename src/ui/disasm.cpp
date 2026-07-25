@@ -505,8 +505,8 @@ void drawDisasm(app::AppState& s)
                 // parse the "module+offset" symbols in `d.text`.
                 formatPlainInstr(s, dec, d.addr, s.asmInput,
                     sizeof(s.asmInput));
-                s.asmError[0]  = '\0';
-                s.showAssemble = true;
+                s.writeError[0] = '\0';
+                s.showAssemble  = true;
             }
             if (ImGui::MenuItem("Change opcode", nullptr, false, d.len != 0))
             {
@@ -525,7 +525,7 @@ void drawDisasm(app::AppState& s)
                             b ? " %02X" : "%02X", raw[b]);
                 else
                     s.opcodeInput[0] = '\0';
-                s.opcodeError[0]   = '\0';
+                s.writeError[0]    = '\0';
                 s.showChangeOpcode = true;
             }
             if (ImGui::MenuItem("Replace with NOP(s)", nullptr, false, d.len != 0))
@@ -647,10 +647,10 @@ void drawAssembleModal(app::AppState& s)
     const bool submit = ImGui::InputText("##asminput", s.asmInput, sizeof(s.asmInput),
         ImGuiInputTextFlags_EnterReturnsTrue);
 
-    if (s.asmError[0])
+    if (s.writeError[0])
     {
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.85f, 0.1f, 0.1f, 1.f), "%s", s.asmError);
+        ImGui::TextColored(ImVec4(0.85f, 0.1f, 0.1f, 1.f), "%s", s.writeError);
     }
 
     ImGui::Spacing();
@@ -743,10 +743,10 @@ void drawChangeOpcodeModal(app::AppState& s)
     const bool submit = ImGui::InputText("##opcodeinput", s.opcodeInput,
         sizeof(s.opcodeInput), ImGuiInputTextFlags_EnterReturnsTrue);
 
-    if (s.opcodeError[0])
+    if (s.writeError[0])
     {
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.85f, 0.1f, 0.1f, 1.f), "%s", s.opcodeError);
+        ImGui::TextColored(ImVec4(0.85f, 0.1f, 0.1f, 1.f), "%s", s.writeError);
     }
 
     ImGui::Spacing();
