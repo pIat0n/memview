@@ -17,11 +17,13 @@ void drawToolbar(app::AppState& s)
     ImGui::SetCursorPosY(5);
 
     // Draw the process icon inside the read-only input: widen the field's left
-    // padding, then paint the icon into that gap once the field is laid out.
+    // padding, then paint the icon into that gap once the field is laid out. The
+    // gap goes by the path, not the texture, so nothing shifts when it lands.
     constexpr float kIconSize = 16.0f;
     ID3D11ShaderResourceView* icon = icons::get(s.procIconPath);
+    const bool reserveIcon = icons::state(s.procIconPath) != icons::State::Missing;
     const ImVec2 basePad = ImGui::GetStyle().FramePadding;
-    if (icon)
+    if (reserveIcon)
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
             ImVec2(basePad.x + kIconSize + 4.0f, basePad.y));
 
@@ -33,14 +35,17 @@ void drawToolbar(app::AppState& s)
         ImGuiInputTextFlags_ReadOnly);
     if (s.procExited) ImGui::PopStyleColor();
 
-    if (icon)
+    if (reserveIcon)
     {
         ImGui::PopStyleVar();
-        const ImVec2 rectMin = ImGui::GetItemRectMin();
-        const float  rectH   = ImGui::GetItemRectSize().y;
-        const ImVec2 iconMin(rectMin.x + basePad.x, rectMin.y + (rectH - kIconSize) * 0.5f);
-        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)icon,
-            iconMin, ImVec2(iconMin.x + kIconSize, iconMin.y + kIconSize));
+        if (icon) // may still be decoding
+        {
+            const ImVec2 rectMin = ImGui::GetItemRectMin();
+            const float  rectH   = ImGui::GetItemRectSize().y;
+            const ImVec2 iconMin(rectMin.x + basePad.x, rectMin.y + (rectH - kIconSize) * 0.5f);
+            ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)icon,
+                iconMin, ImVec2(iconMin.x + kIconSize, iconMin.y + kIconSize));
+        }
     }
 
     ImGui::SameLine();

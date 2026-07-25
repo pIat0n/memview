@@ -1,10 +1,16 @@
+#define NOMINMAX // d3d11.h drags in windows.h, so this has to come first
 #include "ui/process_picker.hpp"
 #include "app/app.hpp"
 #include "memory/driver/driver.hpp"
 #include <imgui.h>
 #include <windows.h>
 #include <shellapi.h> // ExtractIconExW for the icon cache below
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -58,6 +64,25 @@ void drawProcessPicker(app::AppState& s)
 
     ImGui::Separator();
 
+    // Filtered row indices - the clipper needs them contiguous.
+    std::vector<int> rows;
+    rows.reserve(s.procList.size());
+    for (int i = 0; i < (int)s.procList.size(); ++i)
+    {
+        if (s.procFilter[0])
+        {
+            auto icontains = [](const char* hay, const char* nd) {
+                for (; *hay; ++hay)
+                    if (_strnicmp(hay, nd, strlen(nd)) == 0) return true;
+                return false;
+            };
+            char pid[16]; snprintf(pid, sizeof(pid), "%lu", s.procList[i].pid);
+            if (!icontains(s.procList[i].name.c_str(), s.procFilter) &&
+                !icontains(pid, s.procFilter)) continue;
+        }
+        rows.push_back(i);
+    }
+
     const float errH = s.attachError[0] ? ImGui::GetTextLineHeightWithSpacing() : 0.f;
     const float listH = ImGui::GetContentRegionAvail().y
                       - ImGui::GetFrameHeightWithSpacing() - errH - 8;
@@ -104,47 +129,45 @@ void drawProcessPicker(app::AppState& s)
                 ImGui::SetTooltip("Requires the kernel driver - enable it in Settings.");
         }
 
-        for (int i = 0; i < (int)s.procList.size(); ++i)
+        // Also keeps icons cheap: off-screen rows never reach icons::get().
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step())
         {
-            auto& e = s.procList[i];
-
-            if (s.procFilter[0])
+            for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r)
             {
-                auto icontains = [](const char* hay, const char* nd) {
-                    for (; *hay; ++hay)
-                        if (_strnicmp(hay, nd, strlen(nd)) == 0) return true;
-                    return false;
-                };
-                char pid[16]; snprintf(pid, sizeof(pid), "%lu", e.pid);
-                if (!icontains(e.name.c_str(), s.procFilter) &&
-                    !icontains(pid, s.procFilter)) continue;
-            }
+                const int   i = rows[r];
+                const auto& e = s.procList[i];
 
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(1);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(1);
 
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "%lu", e.pid);
-            bool sel = (s.procSelected == i);
-            if (ImGui::Selectable(lbl, sel,
-                ImGuiSelectableFlags_SpanAllColumns |
-                ImGuiSelectableFlags_AllowOverlap))
-                s.procSelected = i;
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "%lu", e.pid);
+                bool sel = (s.procSelected == i);
+                if (ImGui::Selectable(lbl, sel,
+                    ImGuiSelectableFlags_SpanAllColumns |
+                    ImGuiSelectableFlags_AllowOverlap))
+                    s.procSelected = i;
 
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
-            {
-                if (app::attachToProcess(s, e))
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
                 {
-                    s.showProcPicker = false;
-                    ImGui::EndTable(); ImGui::End(); return;
+                    if (app::attachToProcess(s, e))
+                    {
+                        s.showProcPicker = false;
+                        clipper.End(); // has to come before EndTable
+                        ImGui::EndTable(); ImGui::End(); return;
+                    }
                 }
+
+                ImGui::TableSetColumnIndex(0);
+                if (auto* icon = icons::get(e.path))
+                    ImGui::Image((ImTextureID)(intptr_t)icon, ImVec2(kIconSize, kIconSize));
+                else
+                    ImGui::Dummy(ImVec2(kIconSize, kIconSize)); // keeps the row height steady
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(e.name.c_str());
             }
-
-            ImGui::TableSetColumnIndex(0);
-            if (auto* icon = icons::get(e.path))
-                ImGui::Image((ImTextureID)(intptr_t)icon, ImVec2(kIconSize, kIconSize));
-
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(e.name.c_str());
         }
         ImGui::EndTable();
     }
@@ -180,8 +203,47 @@ void drawProcessPicker(app::AppState& s)
 namespace ui::icons {
 
 namespace {
-    ID3D11Device* g_device = nullptr;
-    std::unordered_map<std::string, ID3D11ShaderResourceView*> g_cache;
+    // I/O bound: four threads gave 2.5x, eight gave nothing more (GDI lock).
+    constexpr int kMaxWorkers = 4;
+
+    // Just a cap, so a burst of decodes can't spike a frame.
+    constexpr int kUploadsPerFrame = 16;
+
+    // Generic app icon in imageres.dll - what Explorer shows for the many exes
+    // that carry none of their own.
+    constexpr int kStockIconIndex = 11;
+
+    struct Entry {
+        State                     state = State::Pending;
+        ID3D11ShaderResourceView* srv   = nullptr;
+    };
+
+    struct Job { std::string path; int index = 0; };
+
+    // Worker -> render thread; w == 0 means nothing was extracted.
+    struct Decoded {
+        std::string          path;
+        std::vector<uint8_t> pixels;
+        int                  w = 0, h = 0;
+    };
+
+    // Worker-visible state. On the heap so shutdown() can abandon a stuck worker.
+    struct Shared {
+        std::mutex              mu;
+        std::condition_variable cv;
+        std::vector<Job>        queue; // taken from the back: newest request wins
+        std::vector<Decoded>    done;
+        bool                    stop = false;
+    };
+
+    ID3D11Device*            g_device = nullptr;
+    Shared*                  g_shared = nullptr;
+    std::vector<std::thread> g_workers;
+
+    // Render thread only.
+    std::unordered_map<std::string, Entry> g_cache;
+    std::vector<Decoded>                   g_ready; // waiting for an upload slot
+    ID3D11ShaderResourceView*              g_stock = nullptr;
 
     // Convert an HICON into a top-down 32bpp RGBA buffer. Returns false on failure.
     bool iconToRGBA(HICON hIcon, std::vector<uint8_t>& pixels, int& w, int& h)
@@ -265,6 +327,85 @@ namespace {
         tex->Release();
         return srv;
     }
+
+    // Disk and GDI only - no device, no cache. That's why shutdown() can abandon it.
+    void workerMain(Shared* sh)
+    {
+        for (;;)
+        {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lk(sh->mu);
+                sh->cv.wait(lk, [sh] { return sh->stop || !sh->queue.empty(); });
+                if (sh->stop) return;
+                job = std::move(sh->queue.back());
+                sh->queue.pop_back();
+            }
+
+            Decoded out;
+            out.path = job.path;
+
+            wchar_t pathW[MAX_PATH * 2]; // GLOBALROOT paths can outrun MAX_PATH
+            HICON   hIcon = nullptr;
+            if (MultiByteToWideChar(CP_UTF8, 0, job.path.c_str(), -1,
+                    pathW, MAX_PATH * 2) > 0 &&
+                ExtractIconExW(pathW, job.index, nullptr, &hIcon, 1) > 0 && hIcon)
+            {
+                if (!iconToRGBA(hIcon, out.pixels, out.w, out.h))
+                    out.w = out.h = 0;
+                DestroyIcon(hIcon);
+            }
+
+            std::lock_guard<std::mutex> lk(sh->mu);
+            sh->done.push_back(std::move(out));
+        }
+    }
+
+    const std::string& stockIconPath()
+    {
+        static const std::string path = [] {
+            wchar_t dir[MAX_PATH];
+            const UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) return std::string();
+
+            const std::wstring w = std::wstring(dir, n) + L"\\imageres.dll";
+            char buf[MAX_PATH * 2];
+            if (WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1,
+                    buf, sizeof(buf), nullptr, nullptr) <= 0)
+                return std::string();
+            return std::string(buf);
+        }();
+        return path;
+    }
+
+    void ensureWorkers()
+    {
+        if (!g_shared) g_shared = new Shared();
+        if (!g_workers.empty()) return;
+
+        const unsigned hc = std::thread::hardware_concurrency();
+        const int      n  = (int)std::min<unsigned>(kMaxWorkers, hc ? hc : 1);
+        for (int i = 0; i < n; ++i)
+        {
+            g_workers.emplace_back(workerMain, g_shared);
+            // Same as the symbol worker: never starve the render thread.
+            SetThreadPriority(g_workers.back().native_handle(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+
+    // Queued with the first real request, not at startup.
+    void requestStockIcon()
+    {
+        const std::string& path = stockIconPath();
+        if (path.empty() || g_cache.count(path)) return;
+
+        g_cache.emplace(path, Entry{});
+        {
+            std::lock_guard<std::mutex> lk(g_shared->mu);
+            g_shared->queue.push_back({ path, kStockIconIndex });
+        }
+        g_shared->cv.notify_one();
+    }
 }
 
 void init(ID3D11Device* device)
@@ -277,33 +418,95 @@ ID3D11ShaderResourceView* get(const std::string& exePath)
     if (exePath.empty() || !g_device) return nullptr;
 
     auto it = g_cache.find(exePath);
-    if (it != g_cache.end()) return it->second;
+    if (it != g_cache.end())
+        return it->second.state == State::Fallback ? g_stock : it->second.srv;
 
-    ID3D11ShaderResourceView* srv = nullptr;
+    // The entry doubles as the in-flight marker: eighty svchost.exe rows, one job.
+    g_cache.emplace(exePath, Entry{});
 
-    wchar_t pathW[MAX_PATH];
-    MultiByteToWideChar(CP_UTF8, 0, exePath.c_str(), -1, pathW, MAX_PATH);
-
-    HICON hIcon = nullptr;
-    UINT  n     = ExtractIconExW(pathW, 0, nullptr, &hIcon, 1);
-    if (n > 0 && hIcon)
+    ensureWorkers();
+    requestStockIcon();
     {
-        std::vector<uint8_t> pixels;
-        int w = 0, h = 0;
-        if (iconToRGBA(hIcon, pixels, w, h))
-            srv = uploadTexture(pixels, w, h);
-        DestroyIcon(hIcon);
+        std::lock_guard<std::mutex> lk(g_shared->mu);
+        g_shared->queue.push_back({ exePath, 0 });
+    }
+    g_shared->cv.notify_one();
+    return nullptr;
+}
+
+State state(const std::string& exePath)
+{
+    if (exePath.empty()) return State::Missing;
+    auto it = g_cache.find(exePath);
+    return it == g_cache.end() ? State::Missing : it->second.state;
+}
+
+void pump()
+{
+    if (!g_shared) return;
+
+    {
+        std::lock_guard<std::mutex> lk(g_shared->mu);
+        if (g_ready.empty())
+            g_ready.swap(g_shared->done);
+        else if (!g_shared->done.empty())
+        {
+            for (auto& d : g_shared->done) g_ready.push_back(std::move(d));
+            g_shared->done.clear();
+        }
     }
 
-    g_cache.emplace(exePath, srv); // cache the miss too, so we don't retry every refresh
-    return srv;
+    const size_t n = std::min(g_ready.size(), (size_t)kUploadsPerFrame);
+    for (size_t i = 0; i < n; ++i)
+    {
+        Decoded& d = g_ready[i];
+        Entry&   e = g_cache[d.path];
+        e.srv   = (d.w > 0 && d.h > 0) ? uploadTexture(d.pixels, d.w, d.h) : nullptr;
+        e.state = e.srv ? State::Ready : State::Fallback;
+        if (d.path == stockIconPath()) g_stock = e.srv;
+    }
+    g_ready.erase(g_ready.begin(), g_ready.begin() + n);
 }
 
 void shutdown()
 {
-    for (auto& [path, srv] : g_cache)
-        if (srv) srv->Release();
+    if (g_shared)
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_shared->mu);
+            g_shared->stop = true;
+            g_shared->queue.clear();
+        }
+        g_shared->cv.notify_all();
+
+        // ExtractIconExW can't be cancelled and blocks on a dead share, so give the
+        // workers one budget to notice and don't hang the exit on the rest.
+        const ULONGLONG deadline  = GetTickCount64() + 200;
+        bool            abandoned = false;
+        for (auto& t : g_workers)
+        {
+            const ULONGLONG now  = GetTickCount64();
+            const DWORD     wait = now < deadline ? (DWORD)(deadline - now) : 0;
+            if (WaitForSingleObject(t.native_handle(), wait) == WAIT_OBJECT_0)
+                t.join();
+            else
+            {
+                t.detach();
+                abandoned = true;
+            }
+        }
+        g_workers.clear();
+
+        // An abandoned worker still writes here when it returns, so leak it.
+        if (!abandoned) delete g_shared;
+        g_shared = nullptr;
+    }
+
+    for (auto& [path, e] : g_cache)
+        if (e.srv) e.srv->Release();
     g_cache.clear();
+    g_ready.clear();
+    g_stock  = nullptr;
     g_device = nullptr;
 }
 

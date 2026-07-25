@@ -74,24 +74,6 @@ struct SystemProcessIdInformation {
     UNICODE_STRING ImageName;  // caller supplies Buffer/MaximumLength; fills Length
 };
 
-// Maps an NT device path (\Device\HarddiskVolume3\...) back to a drive letter.
-// Rebuilt each call (26 cheap QueryDosDeviceW lookups) since letters can change.
-inline std::wstring nt_path_to_dos_path(const std::wstring& ntPath)
-{
-    for (wchar_t drive = L'A'; drive <= L'Z'; ++drive)
-    {
-        const wchar_t driveStr[3] = { drive, L':', 0 };
-        wchar_t       target[MAX_PATH];
-        if (QueryDosDeviceW(driveStr, target, MAX_PATH) == 0)
-            continue;
-
-        const size_t len = wcslen(target);
-        if (ntPath.size() > len && _wcsnicmp(ntPath.c_str(), target, len) == 0 && ntPath[len] == L'\\')
-            return std::wstring(driveStr, 2) + ntPath.substr(len);
-    }
-    return {};
-}
-
 inline bool process_exists(DWORD pid)
 {
     SystemProcessIdInformation info{};
@@ -129,14 +111,15 @@ inline std::vector<ProcessEntry> list_processes()
             if (NtQuerySystemInformation(detail::kSystemProcessIdInformation, &info, sizeof(info), nullptr) >= 0
                 && info.ImageName.Length > 0)
             {
-                const std::wstring ntPath(info.ImageName.Buffer, info.ImageName.Length / sizeof(wchar_t));
-                const std::wstring dosPath = detail::nt_path_to_dos_path(ntPath);
-                if (!dosPath.empty())
-                {
-                    char pbuf[MAX_PATH];
-                    WideCharToMultiByte(CP_UTF8, 0, dosPath.c_str(), -1, pbuf, MAX_PATH, nullptr, nullptr);
+                // GLOBALROOT turns the NT path Win32 won't take into one it will,
+                // with no drive letter involved.
+                const std::wstring ntPath = L"\\\\?\\GLOBALROOT"
+                    + std::wstring(info.ImageName.Buffer, info.ImageName.Length / sizeof(wchar_t));
+
+                char pbuf[MAX_PATH * 2]; // an NT path can outrun MAX_PATH
+                if (WideCharToMultiByte(CP_UTF8, 0, ntPath.c_str(), -1,
+                        pbuf, sizeof(pbuf), nullptr, nullptr) > 0)
                     e.path = pbuf;
-                }
             }
 
             out.push_back(std::move(e));

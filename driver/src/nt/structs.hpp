@@ -2,8 +2,6 @@
 
 #include "functions.hpp"
 
-// --- Native (matches the process's own bitness) -----------------------------
-
 typedef struct _LDR_DATA_TABLE_ENTRY64
 {
     LIST_ENTRY     InLoadOrderLinks;
@@ -23,10 +21,6 @@ typedef struct _PEB_LDR_DATA64
     LIST_ENTRY InLoadOrderModuleList;
     LIST_ENTRY InMemoryOrderModuleList;
 } PEB_LDR_DATA64;
-
-// --- WOW64 (32-bit target on 64-bit Windows) --------------------------------
-// LIST_ENTRY32 and UNICODE_STRING32 (ULONG Flink/Blink; USHORT+USHORT+ULONG) are
-// already declared in <ntdef.h> - reused here rather than redefined.
 
 typedef struct _LDR_DATA_TABLE_ENTRY32
 {

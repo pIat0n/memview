@@ -280,6 +280,8 @@ void App::drawFrame()
     // per-module PE reads across frames rather than stalling the click frame.
     pumpSymbolScan(state_);
 
+    ui::icons::pump();
+
     // Pin the root window to the main viewport, so the UI stays inside the main
     // OS window rather than spawning its own.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
