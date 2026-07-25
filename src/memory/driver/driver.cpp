@@ -60,20 +60,6 @@ size_t drvWrite(DWORD pid, uintptr_t addr, const void* buf, size_t n)
     return n;
 }
 
-bool drvIsAlive(DWORD pid)
-{
-    if (g_device == INVALID_HANDLE_VALUE)
-        return false;
-
-    MEMVIEW_PID_REQUEST req{ pid };
-    MEMVIEW_PROCESS_INFO info{};
-    DWORD returned = 0;
-    if (!DeviceIoControl(g_device, MEMVIEW_IOCTL_QUERY_PROCESS, &req, sizeof(req),
-                         &info, sizeof(info), &returned, nullptr))
-        return false;
-    return info.alive != 0;
-}
-
 bool drvIsWow64(DWORD pid)
 {
     if (g_device == INVALID_HANDLE_VALUE)
@@ -162,7 +148,6 @@ void registerBackend()
 {
     mem::g_kernel.read        = &drvRead;
     mem::g_kernel.write       = &drvWrite;
-    mem::g_kernel.isAlive     = &drvIsAlive;
     mem::g_kernel.isWow64     = &drvIsWow64;
     mem::g_kernel.listModules = &drvListModules;
     mem::g_kernel.queryRegion = &drvQueryRegion;

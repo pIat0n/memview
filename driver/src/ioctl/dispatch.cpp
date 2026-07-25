@@ -97,10 +97,12 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT, PIRP irp)
         const MEMVIEW_PID_REQUEST req = *static_cast<MEMVIEW_PID_REQUEST*>(sysBuf);
 
         MEMVIEW_PROCESS_INFO info{};
-        QueryProcess(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(req.pid)), info);
-        *static_cast<MEMVIEW_PROCESS_INFO*>(sysBuf) = info;
-        copied = sizeof(info);
-        status = STATUS_SUCCESS;
+        status = QueryProcess(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(req.pid)), info);
+        if (NT_SUCCESS(status))
+        {
+            *static_cast<MEMVIEW_PROCESS_INFO*>(sysBuf) = info;
+            copied = sizeof(info);
+        }
         break;
     }
 

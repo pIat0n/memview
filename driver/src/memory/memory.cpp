@@ -35,38 +35,25 @@ private:
     NTSTATUS  m_status  = STATUS_UNSUCCESSFUL;
 };
 
-// Plain ACCESS_MASK bit values for process rights - not in any kernel header
-// (only <winnt.h>, usermode-only), but these have never changed, so they're
-// safe to hardcode for ObOpenObjectByPointer's DesiredAccess below.
-constexpr ACCESS_MASK kProcessVmOperation      = 0x0008;
-constexpr ACCESS_MASK kProcessQueryInformation = 0x0400;
-
-// Kernel-minted handle (not a usermode OpenProcess), for one IOCTL call. Only
-// QueryRegion/ProtectMemory need this; everything else uses MmCopyVirtualMemory directly.
-class KernelProcessHandle
+// Attaches to `process` so the Zw* calls below can target it via ZwCurrentProcess() - no handle opened.
+class ProcessAttach
 {
 public:
-    KernelProcessHandle(PEPROCESS process, ACCESS_MASK access)
+    explicit ProcessAttach(PEPROCESS process)
     {
-        m_status = ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, nullptr,
-            access, *PsProcessType, KernelMode, &m_handle);
+        KeStackAttachProcess(process, &m_apc);
     }
 
-    ~KernelProcessHandle()
+    ~ProcessAttach()
     {
-        if (NT_SUCCESS(m_status))
-            ZwClose(m_handle);
+        KeUnstackDetachProcess(&m_apc);
     }
 
-    KernelProcessHandle(const KernelProcessHandle&)            = delete;
-    KernelProcessHandle& operator=(const KernelProcessHandle&) = delete;
-
-    NTSTATUS status() const { return m_status; }
-    HANDLE   get() const    { return m_handle; }
+    ProcessAttach(const ProcessAttach&)            = delete;
+    ProcessAttach& operator=(const ProcessAttach&) = delete;
 
 private:
-    HANDLE   m_handle = nullptr;
-    NTSTATUS m_status = STATUS_UNSUCCESSFUL;
+    KAPC_STATE m_apc;
 };
 
 // Reads cross-process into this (system) context; false on any short/failed copy.
@@ -177,17 +164,16 @@ NTSTATUS WriteProcessMemory(HANDLE pid, PVOID address, PVOID in, SIZE_T size, PS
                                 size, KernelMode, copied);
 }
 
-void QueryProcess(HANDLE pid, MEMVIEW_PROCESS_INFO& out)
+NTSTATUS QueryProcess(HANDLE pid, MEMVIEW_PROCESS_INFO& out)
 {
-    out.alive   = FALSE;
     out.isWow64 = FALSE;
 
     ProcessRef target(pid);
     if (!NT_SUCCESS(target.status()))
-        return;
+        return target.status();
 
-    out.alive   = TRUE;
     out.isWow64 = PsGetProcessWow64Process(target.get()) != nullptr;
+    return STATUS_SUCCESS;
 }
 
 ULONG ListModules(HANDLE pid, MEMVIEW_MODULE_INFO* out, ULONG maxCount)
@@ -214,14 +200,14 @@ NTSTATUS QueryRegion(HANDLE pid, PVOID address, MEMVIEW_REGION_INFO& out)
     if (!NT_SUCCESS(target.status()))
         return target.status();
 
-    KernelProcessHandle handle(target.get(), kProcessQueryInformation);
-    if (!NT_SUCCESS(handle.status()))
-        return handle.status();
-
     MEMORY_BASIC_INFORMATION mbi{};
     SIZE_T returned = 0;
-    const NTSTATUS status = ZwQueryVirtualMemory(handle.get(), address,
-        MemoryBasicInformation, &mbi, sizeof(mbi), &returned);
+    NTSTATUS status;
+    {
+        ProcessAttach attach(target.get());
+        status = ZwQueryVirtualMemory(ZwCurrentProcess(), address,
+            MemoryBasicInformation, &mbi, sizeof(mbi), &returned);
+    }
     if (!NT_SUCCESS(status))
         return status;
 
@@ -241,13 +227,10 @@ NTSTATUS ProtectMemory(HANDLE pid, PVOID address, SIZE_T size, ULONG newProtect,
     if (!NT_SUCCESS(target.status()))
         return target.status();
 
-    KernelProcessHandle handle(target.get(), kProcessVmOperation);
-    if (!NT_SUCCESS(handle.status()))
-        return handle.status();
-
     PVOID  base       = address;
     SIZE_T regionSize = size;
-    return ZwProtectVirtualMemory(handle.get(), &base, &regionSize, newProtect, &oldProtect);
+    ProcessAttach attach(target.get());
+    return ZwProtectVirtualMemory(ZwCurrentProcess(), &base, &regionSize, newProtect, &oldProtect);
 }
 
 } // namespace memview

@@ -68,7 +68,6 @@ struct Region {
 struct KernelBackend {
     size_t (*read)(DWORD pid, uintptr_t addr, void* buf, size_t n)       = nullptr;
     size_t (*write)(DWORD pid, uintptr_t addr, const void* buf, size_t n) = nullptr;
-    bool   (*isAlive)(DWORD pid) = nullptr;
     bool   (*isWow64)(DWORD pid) = nullptr;
     std::vector<ModuleEntry> (*listModules)(DWORD pid) = nullptr;
     bool   (*queryRegion)(DWORD pid, uintptr_t addr, Region& out) = nullptr;
@@ -108,6 +107,14 @@ inline std::wstring nt_path_to_dos_path(const std::wstring& ntPath)
             return std::wstring(driveStr, 2) + ntPath.substr(len);
     }
     return {};
+}
+
+inline bool process_exists(DWORD pid)
+{
+    SystemProcessIdInformation info{};
+    info.ProcessId = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
+    return NtQuerySystemInformation(kSystemProcessIdInformation, &info, sizeof(info), nullptr)
+        != static_cast<NTSTATUS>(0xC000000B); // STATUS_INVALID_CID
 }
 
 } // namespace detail
@@ -156,16 +163,14 @@ inline std::vector<ProcessEntry> list_processes()
     return out;
 }
 
-// SYNCHRONIZE lets is_alive() wait on the handle (WinApi only) - Backend::Kernel
-// skips OpenProcess entirely and confirms the pid through the driver instead.
+// Backend::Kernel: confirm the pid exists instead of opening a handle.
 inline bool open(Process& proc, DWORD pid, Backend backend = Backend::WinApi,
     DWORD access = PROCESS_VM_READ | PROCESS_VM_WRITE |
-                   PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION |
-                   SYNCHRONIZE)
+                   PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION)
 {
     if (backend == Backend::Kernel)
     {
-        if (!g_kernel.isAlive || !g_kernel.isAlive(pid))
+        if (!detail::process_exists(pid))
             return false;
         proc.handle  = nullptr;
         proc.pid     = pid;
@@ -201,8 +206,7 @@ inline bool open(Process& proc, DWORD pid, Backend backend = Backend::WinApi,
 
 inline bool open_by_name(Process& proc, const char* exe_name, Backend backend = Backend::WinApi,
     DWORD access = PROCESS_VM_READ | PROCESS_VM_WRITE |
-                   PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION |
-                   SYNCHRONIZE)
+                   PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION)
 {
     for (auto& e : list_processes())
         if (_stricmp(e.name.c_str(), exe_name) == 0)
@@ -236,13 +240,10 @@ inline bool enable_debug_privilege()
 }
 
 // False once the target has exited (is_open() alone can't tell - the handle/pid
-// stays valid until close()). A failed wait counts as alive.
+// stays valid until close()).
 inline bool is_alive(const Process& proc)
 {
-    if (!proc.is_open()) return false;
-    if (proc.backend == Backend::Kernel)
-        return g_kernel.isAlive && g_kernel.isAlive(proc.pid);
-    return WaitForSingleObject(proc.handle, 0) != WAIT_OBJECT_0;
+    return proc.is_open() && detail::process_exists(proc.pid);
 }
 
 inline void close(Process& proc)

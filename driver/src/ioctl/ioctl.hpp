@@ -40,9 +40,8 @@ typedef struct _MEMVIEW_PID_REQUEST {
     unsigned long long pid;
 } MEMVIEW_PID_REQUEST;
 
-// QUERY_PROCESS out: liveness + bitness.
+// QUERY_PROCESS out: bitness only.
 typedef struct _MEMVIEW_PROCESS_INFO {
-    unsigned char alive;
     unsigned char isWow64;
 } MEMVIEW_PROCESS_INFO;
 
